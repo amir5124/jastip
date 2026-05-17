@@ -3,37 +3,19 @@ const axios = require('axios');
 const cors = require('cors');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(cors());
+app.use(express.json());
 app.use(express.static('public'));
 
-// Konfigurasi
-const COMPONENT_VIEW_UID = '618e70133c5ca';  // dari URL contoh
+// Konfigurasi dari Jagel
+const COMPONENT_VIEW_UID = '618e70133c5ca';
 const CODENAME = 'iknlinku';
 const GOOGLE_API_KEY = 'AIzaSyCxfdljVSgNFeQKfEzNzeUJUuJVxSxntVQ';
 
-// Koordinat Batang (Jawa Tengah) – bisa juga diambil dari geocoding
-let batangCoords = null;
-
-// Fungsi untuk mendapatkan koordinat Batang dari Google (sekali saat startup)
-async function initBatangCoords() {
-    try {
-        const url = `https://maps.googleapis.com/maps/api/geocode/json?address=Batang, Indonesia&key=${GOOGLE_API_KEY}`;
-        const response = await axios.get(url);
-        if (response.data.status === 'OK' && response.data.results.length) {
-            const loc = response.data.results[0].geometry.location;
-            batangCoords = { lat: loc.lat, lng: loc.lng };
-            console.log(`📍 Koordinat Batang: ${batangCoords.lat}, ${batangCoords.lng}`);
-        } else {
-            console.warn('Gagal mendapatkan koordinat Batang, gunakan default');
-            batangCoords = { lat: -6.894, lng: 110.694 }; // fallback
-        }
-    } catch (err) {
-        console.error('Error geocoding Batang:', err.message);
-        batangCoords = { lat: -6.894, lng: 110.694 };
-    }
-}
+// Default koordinat (Sepaku, Kalimantan Timur)
+let defaultCoords = { lat: -0.975, lng: 116.786 }; // Sepaku, Nusantara
 
 // Hitung jarak haversine (km)
 function getDistance(lat1, lon1, lat2, lon2) {
@@ -44,15 +26,13 @@ function getDistance(lat1, lon1, lat2, lon2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Ambil semua toko dari component (semua halaman)
+// Ambil semua toko dari component (pagination)
 async function fetchAllStoresFromComponent() {
     let allStores = [];
     let currentPage = 1;
     let lastPage = 1;
-
     do {
         const url = `https://app.jagel.id/api/v2/customer/component/${COMPONENT_VIEW_UID}?codename=${CODENAME}&page=${currentPage}&app_mode=1&per_page=24`;
-        console.log(`🌐 Fetch component page ${currentPage}: ${url}`);
         const response = await axios.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0',
@@ -67,16 +47,13 @@ async function fetchAllStoresFromComponent() {
         allStores.push(...stores);
         lastPage = lists.last_page;
         currentPage++;
-        console.log(`  📦 Dapat ${stores.length} toko, total sementara ${allStores.length}`);
     } while (currentPage <= lastPage);
-
     return allStores;
 }
 
-// Ambil detail toko (termasuk alamat dan koordinat)
+// Ambil detail toko (alamat, koordinat, dll)
 async function fetchStoreDetail(viewUid) {
     const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}?codename=${CODENAME}`;
-    console.log(`🔍 Fetch detail for ${viewUid}`);
     const response = await axios.get(url, {
         headers: {
             'User-Agent': 'Mozilla/5.0',
@@ -89,21 +66,31 @@ async function fetchStoreDetail(viewUid) {
     return response.data.data;
 }
 
-// Endpoint utama yang mengembalikan semua toko dengan jarak dari Batang
+// Endpoint utama: terima query lat, lng (opsional)
 app.get('/api/all-stores', async (req, res) => {
     try {
-        console.log('\n🚀 Memulai fetch semua toko...');
-        // 1. Ambil semua toko dari component
+        // Ambil koordinat dari query parameter, jika tidak ada pakai default
+        let userLat = parseFloat(req.query.lat);
+        let userLng = parseFloat(req.query.lng);
+        let userCoords = null;
+        if (!isNaN(userLat) && !isNaN(userLng)) {
+            userCoords = { lat: userLat, lng: userLng };
+            console.log(`📍 Menggunakan koordinat user: ${userLat}, ${userLng}`);
+        } else {
+            userCoords = defaultCoords;
+            console.log(`📍 Menggunakan koordinat default (Sepaku): ${defaultCoords.lat}, ${defaultCoords.lng}`);
+        }
+
+        // Ambil semua toko dari component
         const stores = await fetchAllStoresFromComponent();
         console.log(`📋 Total toko dari component: ${stores.length}`);
 
-        // 2. Untuk setiap toko, ambil detail (koordinat, alamat, dll)
         const storesWithDetail = [];
         for (const store of stores) {
             try {
                 const detail = await fetchStoreDetail(store.view_uid);
-                const distance = (batangCoords && detail.origin_lat && detail.origin_lng)
-                    ? getDistance(batangCoords.lat, batangCoords.lng, detail.origin_lat, detail.origin_lng)
+                const distance = (userCoords && detail.origin_lat && detail.origin_lng)
+                    ? getDistance(userCoords.lat, userCoords.lng, detail.origin_lat, detail.origin_lng)
                     : null;
                 storesWithDetail.push({
                     view_uid: store.view_uid,
@@ -121,8 +108,6 @@ app.get('/api/all-stores', async (req, res) => {
                 });
                 console.log(`  ✅ ${store.title} - jarak: ${distance?.toFixed(2)} km`);
             } catch (err) {
-                console.error(`  ❌ Gagal detail untuk ${store.view_uid}: ${err.message}`);
-                // tetap masukkan tanpa jarak
                 storesWithDetail.push({
                     view_uid: store.view_uid,
                     title: store.title,
@@ -139,26 +124,16 @@ app.get('/api/all-stores', async (req, res) => {
             }
         }
 
-        // 3. Urutkan berdasarkan jarak (yang null di akhir)
-        storesWithDetail.sort((a, b) => {
-            if (a.distance === null && b.distance === null) return 0;
-            if (a.distance === null) return 1;
-            if (b.distance === null) return -1;
-            return a.distance - b.distance;
-        });
+        // Urutkan berdasarkan jarak (null di akhir)
+        storesWithDetail.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
 
-        console.log(`✅ Selesai, total ${storesWithDetail.length} toko terurut.\n`);
-        res.json({ success: true, stores: storesWithDetail });
+        res.json({ success: true, stores: storesWithDetail, userCoords });
     } catch (error) {
-        console.error('❌ Error di /api/all-stores:', error.message);
+        console.error('❌ Error:', error.message);
         res.status(500).json({ success: false, error: error.message });
     }
 });
 
-// Jalankan server
-app.listen(PORT, async () => {
-    console.log(`\n🚀 Proxy server berjalan di http://localhost:${PORT}`);
-    console.log(`📦 Frontend: http://localhost:${PORT}`);
-    await initBatangCoords();
-    console.log(`✅ Siap melayani request\n`);
+app.listen(PORT, () => {
+    console.log(`🚀 Backend berjalan di port ${PORT}`);
 });
