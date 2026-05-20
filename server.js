@@ -10,7 +10,8 @@ app.use(express.json());
 app.use(express.static('public'));
 
 // Konfigurasi dari Jagel
-const COMPONENT_VIEW_UID = '618e70133c5ca';
+const STORE_COMPONENT_UID = '618e70133c5ca';  // untuk toko
+const MENU_COMPONENT_UID = '618b7f0c383e4';   // untuk menu (BARU)
 const CODENAME = 'iknlinku';
 
 // Default koordinat (Sepaku, Kalimantan Timur)
@@ -34,7 +35,7 @@ async function fetchAllStoresFromComponent() {
     let currentPage = 1;
     let lastPage = 1;
     do {
-        const url = `https://app.jagel.id/api/v2/customer/component/${COMPONENT_VIEW_UID}?codename=${CODENAME}&page=${currentPage}&app_mode=1&per_page=24`;
+        const url = `https://app.jagel.id/api/v2/customer/component/${STORE_COMPONENT_UID}?codename=${CODENAME}&page=${currentPage}&app_mode=1&per_page=24`;
         const response = await axios.get(url, {
             headers: {
                 'User-Agent': 'Mozilla/5.0',
@@ -52,6 +53,30 @@ async function fetchAllStoresFromComponent() {
     return allStores;
 }
 
+// Ambil semua menu dari component baru (pagination)
+async function fetchAllMenusFromComponent() {
+    let allMenus = [];
+    let currentPage = 1;
+    let lastPage = 1;
+    do {
+        const url = `https://app.jagel.id/api/v2/customer/component/${MENU_COMPONENT_UID}?codename=${CODENAME}&page=${currentPage}&app_mode=1&per_page=24`;
+        const response = await axios.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0',
+                'Origin': 'https://app.linku.co.id',
+                'Referer': 'https://app.linku.co.id/',
+                'Accept': 'application/json'
+            }
+        });
+        if (!response.data.success) throw new Error('Menu Component API error');
+        const lists = response.data.data.lists;
+        allMenus.push(...(lists.data || []));
+        lastPage = lists.last_page;
+        currentPage++;
+    } while (currentPage <= lastPage);
+    return allMenus;
+}
+
 // Ambil detail toko
 async function fetchStoreDetail(viewUid) {
     const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}?codename=${CODENAME}`;
@@ -64,6 +89,21 @@ async function fetchStoreDetail(viewUid) {
         }
     });
     if (!response.data.success) throw new Error(`Detail API error for ${viewUid}`);
+    return response.data.data;
+}
+
+// Ambil detail menu (jika perlu)
+async function fetchMenuDetail(viewUid) {
+    const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}?codename=${CODENAME}`;
+    const response = await axios.get(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0',
+            'Origin': 'https://app.linku.co.id',
+            'Referer': 'https://app.linku.co.id/',
+            'Accept': 'application/json'
+        }
+    });
+    if (!response.data.success) throw new Error(`Menu Detail API error for ${viewUid}`);
     return response.data.data;
 }
 
@@ -127,57 +167,121 @@ app.get('/api/all-stores', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// ENDPOINT BARU: /api/stores-stream  →  Server-Sent Events
-//
-// Alur:
-//   1. Kirim event "meta"  → info koordinat user & total toko
-//   2. Ambil detail tiap toko secara PARALEL (batch 5)
-//   3. Setiap toko selesai → langsung kirim event "store"
-//   4. Kirim event "done"  → selesai
+// ENDPOINT BARU 1: /api/menus-stream → Server-Sent Events untuk MENU
 // ─────────────────────────────────────────────────────────────
-app.get('/api/stores-stream', async (req, res) => {
-    // Header SSE
+app.get('/api/menus-stream', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // disable nginx buffering
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
 
-    // Helper kirim event SSE
     const send = (event, data) => {
         res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-        // Flush jika tersedia (beberapa server butuh ini)
         if (typeof res.flush === 'function') res.flush();
     };
 
-    // Tutup koneksi jika client disconnect
     req.on('close', () => res.end());
 
     try {
-        // Koordinat user
+        console.log(`🍽️  Stream menu dimulai`);
+
+        const menus = await fetchAllMenusFromComponent();
+        console.log(`📋 Total menu: ${menus.length}`);
+
+        send('meta', { total: menus.length, type: 'menu' });
+
+        const BATCH_SIZE = 5;
+        let index = 0;
+
+        for (let i = 0; i < menus.length; i += BATCH_SIZE) {
+            const batch = menus.slice(i, i + BATCH_SIZE);
+
+            await Promise.all(
+                batch.map(async (menu) => {
+                    try {
+                        const detail = await fetchMenuDetail(menu.view_uid);
+
+                        const menuData = {
+                            view_uid: menu.view_uid,
+                            title: menu.title,
+                            image: menu.image,
+                            content: detail.content || '',
+                            price: detail.price || null,
+                            category: detail.category || '',
+                            is_available: detail.is_available || 1,
+                            seller_rating: detail.seller_rating,
+                            link_view: menu.link_view
+                        };
+
+                        console.log(`  ✅ [${++index}/${menus.length}] ${menu.title}`);
+                        send('menu', menuData);
+                    } catch (err) {
+                        send('menu', {
+                            view_uid: menu.view_uid,
+                            title: menu.title,
+                            image: menu.image,
+                            content: '',
+                            price: null,
+                            category: '',
+                            is_available: 0,
+                            link_view: menu.link_view,
+                            _error: true
+                        });
+                        console.warn(`  ⚠️  Gagal load menu ${menu.title}: ${err.message}`);
+                    }
+                })
+            );
+        }
+
+        send('done', { total: menus.length });
+        console.log(`✅ Stream menu selesai — ${menus.length} menu dikirim`);
+        res.end();
+
+    } catch (error) {
+        console.error('❌ Stream menu error:', error.message);
+        send('error', { message: error.message });
+        res.end();
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// ENDPOINT BARU 2: /api/stores-stream  →  Server-Sent Events untuk TOKO
+// ─────────────────────────────────────────────────────────────
+app.get('/api/stores-stream', async (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    const send = (event, data) => {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+    };
+
+    req.on('close', () => res.end());
+
+    try {
         const userLat = parseFloat(req.query.lat);
         const userLng = parseFloat(req.query.lng);
         const userCoords = (!isNaN(userLat) && !isNaN(userLng))
             ? { lat: userLat, lng: userLng }
             : defaultCoords;
 
-        console.log(`📍 Stream dimulai — koordinat: ${userCoords.lat}, ${userCoords.lng}`);
+        console.log(`📍 Stream toko dimulai — koordinat: ${userCoords.lat}, ${userCoords.lng}`);
 
-        // Ambil daftar toko dari component (pagination)
         const stores = await fetchAllStoresFromComponent();
         console.log(`📋 Total toko: ${stores.length}`);
 
-        // Kirim meta dulu supaya frontend tahu total
-        send('meta', { total: stores.length, userCoords });
+        send('meta', { total: stores.length, userCoords, type: 'store' });
 
-        // Proses detail toko secara paralel per BATCH
-        const BATCH_SIZE = 5; // ambil 5 toko sekaligus
+        const BATCH_SIZE = 5;
         let index = 0;
 
         for (let i = 0; i < stores.length; i += BATCH_SIZE) {
             const batch = stores.slice(i, i + BATCH_SIZE);
 
-            // Jalankan batch secara paralel, tiap yang selesai langsung kirim
             await Promise.all(
                 batch.map(async (store) => {
                     try {
@@ -203,9 +307,8 @@ app.get('/api/stores-stream', async (req, res) => {
                         };
 
                         console.log(`  ✅ [${++index}/${stores.length}] ${store.title} — ${distance?.toFixed(2)} km`);
-                        send('store', storeData); // langsung kirim ke frontend!
+                        send('store', storeData);
                     } catch (err) {
-                        // Tetap kirim walau gagal, supaya counter frontend sinkron
                         send('store', {
                             view_uid: store.view_uid,
                             title: store.title,
@@ -229,18 +332,63 @@ app.get('/api/stores-stream', async (req, res) => {
         }
 
         send('done', { total: stores.length });
-        console.log(`✅ Stream selesai — ${stores.length} toko dikirim`);
+        console.log(`✅ Stream toko selesai — ${stores.length} toko dikirim`);
         res.end();
 
     } catch (error) {
-        console.error('❌ Stream error:', error.message);
+        console.error('❌ Stream toko error:', error.message);
         send('error', { message: error.message });
         res.end();
     }
 });
 
+// ─────────────────────────────────────────────────────────────
+// ENDPOINT UNTUK MENDAPATKAN SEMUA MENU (JSON biasa)
+// ─────────────────────────────────────────────────────────────
+app.get('/api/all-menus', async (req, res) => {
+    try {
+        const menus = await fetchAllMenusFromComponent();
+        const menusWithDetail = [];
+
+        for (const menu of menus) {
+            try {
+                const detail = await fetchMenuDetail(menu.view_uid);
+                menusWithDetail.push({
+                    view_uid: menu.view_uid,
+                    title: menu.title,
+                    image: menu.image,
+                    content: detail.content || '',
+                    price: detail.price || null,
+                    category: detail.category || '',
+                    is_available: detail.is_available || 1,
+                    seller_rating: detail.seller_rating,
+                    link_view: menu.link_view
+                });
+            } catch {
+                menusWithDetail.push({
+                    view_uid: menu.view_uid,
+                    title: menu.title,
+                    image: menu.image,
+                    content: '',
+                    price: null,
+                    category: '',
+                    is_available: 0,
+                    link_view: menu.link_view
+                });
+            }
+        }
+
+        res.json({ success: true, menus: menusWithDetail, total: menusWithDetail.length });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`🚀 Backend berjalan di port ${PORT}`);
-    console.log(`   → SSE stream: GET /api/stores-stream?lat=...&lng=...`);
-    console.log(`   → JSON lama : GET /api/all-stores?lat=...&lng=...`);
+    console.log(`\n📦 ENDPOINT TERSEDIA:`);
+    console.log(`   🏪 Toko (SSE)  : GET /api/stores-stream?lat=...&lng=...`);
+    console.log(`   🏪 Toko (JSON) : GET /api/all-stores?lat=...&lng=...`);
+    console.log(`   🍽️  Menu (SSE)  : GET /api/menus-stream`);
+    console.log(`   🍽️  Menu (JSON) : GET /api/all-menus`);
 });
