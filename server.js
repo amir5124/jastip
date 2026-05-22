@@ -9,15 +9,25 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Konfigurasi dari Jagel
+// ─── KONFIGURASI ──────────────────────────────────────────────
 const STORE_COMPONENT_UID = '618e70133c5ca';
 const UWARUNG_COMPONENT_UID = '618b7f0c383e4';
 const CODENAME = 'iknlinku';
+const DEFAULT_COORDS = { lat: -0.975, lng: 116.786 };
+const BATCH_SIZE = 3; // Kirim ke frontend setiap 3 toko selesai diproses
 
-// Default koordinat
-const defaultCoords = { lat: -0.975, lng: 116.786 };
+// ─── KATEGORISASI TOKO ────────────────────────────────────────
+// Urutan penting: cek yang lebih spesifik dulu
+function getStoreCategory(title = '') {
+    const t = title.toLowerCase();
+    if (t.includes('alfamidi')) return 'alfamidi';
+    if (t.includes('alfamart')) return 'alfamart';
+    if (t.includes('indomaret')) return 'indomaret';
+    if (t.includes('laras mitra') || t.includes('buah') || t.includes('fresh')) return 'fresh_shop';
+    return 'toko'; // default: toko umum
+}
 
-// Hitung jarak haversine (km)
+// ─── HAVERSINE ────────────────────────────────────────────────
 function getDistance(lat1, lon1, lat2, lon2) {
     const R = 6371;
     const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -28,59 +38,37 @@ function getDistance(lat1, lon1, lat2, lon2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Ambil semua toko dari component (pagination)
-async function fetchAllStoresFromComponent(componentUid) {
-    let allStores = [];
-    let currentPage = 1;
-    let lastPage = 1;
+// ─── FETCH HELPERS ────────────────────────────────────────────
+const HEADERS = {
+    'User-Agent': 'Mozilla/5.0',
+    'Origin': 'https://app.linku.co.id',
+    'Referer': 'https://app.linku.co.id/',
+    'Accept': 'application/json'
+};
+
+async function fetchAllStoresFromUWarung() {
+    let all = [], page = 1, last = 1;
     do {
-        const url = `https://app.jagel.id/api/v2/customer/component/${componentUid}?codename=${CODENAME}&page=${currentPage}&app_mode=1&per_page=24`;
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0',
-                'Origin': 'https://app.linku.co.id',
-                'Referer': 'https://app.linku.co.id/',
-                'Accept': 'application/json'
-            }
-        });
-        if (!response.data.success) throw new Error('Component API error');
-        const lists = response.data.data.lists;
-        allStores.push(...(lists.data || []));
-        lastPage = lists.last_page;
-        currentPage++;
-    } while (currentPage <= lastPage);
-    return allStores;
+        const url = `https://app.jagel.id/api/v2/customer/component/${UWARUNG_COMPONENT_UID}?codename=${CODENAME}&page=${page}&app_mode=1&per_page=24`;
+        const r = await axios.get(url, { headers: HEADERS });
+        if (!r.data.success) throw new Error('UWarung API error');
+        const lists = r.data.data.lists;
+        all.push(...(lists.data || []));
+        last = lists.last_page;
+        page++;
+    } while (page <= last);
+    return all;
 }
 
-// Ambil detail toko (mengandung origin_address)
 async function fetchStoreDetail(viewUid) {
     const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}?codename=${CODENAME}`;
-    const response = await axios.get(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0',
-            'Origin': 'https://app.linku.co.id',
-            'Referer': 'https://app.linku.co.id/',
-            'Accept': 'application/json'
-        }
-    });
-    if (!response.data.success) throw new Error(`Detail API error for ${viewUid}`);
-    return response.data.data;
+    const r = await axios.get(url, { headers: HEADERS });
+    if (!r.data.success) throw new Error(`Detail error for ${viewUid}`);
+    return r.data.data;
 }
 
-// Tentukan kategori toko berdasarkan judul
-function getStoreCategory(title) {
-    const t = title.toLowerCase();
-    if (t.includes('indomaret')) return 'indomaret';
-    if (t.includes('alfamart') && !t.includes('alfamidi')) return 'alfamart';
-    if (t.includes('alfamidi')) return 'alfamidi';
-    if (t.includes('maxi')) return 'maxi';
-    if (t.includes('laras mitra') || t.includes('buah')) return 'fresh_shop';
-    return 'toko';
-}
-
-// ─────────────────────────────────────────────────────────────
-// ENDPOINT STREAMING: /api/stores-stream
-// Mengirim data toko secara bertahap (3 per batch)
+// ─── ENDPOINT: /api/stores-stream ─────────────────────────────
+// Streaming 3 toko per batch via Server-Sent Events
 // ─────────────────────────────────────────────────────────────
 app.get('/api/stores-stream', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -101,162 +89,172 @@ app.get('/api/stores-stream', async (req, res) => {
         const userLng = parseFloat(req.query.lng);
         const userCoords = (!isNaN(userLat) && !isNaN(userLng))
             ? { lat: userLat, lng: userLng }
-            : defaultCoords;
+            : DEFAULT_COORDS;
 
-        console.log(`📍 Stream toko dimulai — koordinat: ${userCoords.lat}, ${userCoords.lng}`);
+        console.log(`🚀 Stream dimulai — lat:${userCoords.lat} lng:${userCoords.lng}`);
 
-        // Ambil semua toko dari kedua component
-        console.log('📦 Mengambil toko dari component...');
-        const [backendStores, uwarungStores] = await Promise.all([
-            fetchAllStoresFromComponent(STORE_COMPONENT_UID),
-            fetchAllStoresFromComponent(UWARUNG_COMPONENT_UID)
-        ]);
+        // Ambil daftar toko
+        const stores = await fetchAllStoresFromUWarung();
+        console.log(`📋 Total toko: ${stores.length}`);
 
-        // Gabungkan dan hindari duplikat
-        const mergedMap = new Map();
-        [...backendStores, ...uwarungStores].forEach(store => {
-            if (!mergedMap.has(store.view_uid)) {
-                mergedMap.set(store.view_uid, store);
-            }
-        });
+        send('meta', { total_stores: stores.length, userCoords });
 
-        const stores = Array.from(mergedMap.values());
-        console.log(`📋 Total toko unik: ${stores.length}`);
-
-        send('meta', { total: stores.length, userCoords });
-
-        // Proses toko satu per satu dan kirim segera
-        let processed = 0;
-        const BATCH_SIZE = 3;
+        let batch = [];
+        let totalDone = 0;
 
         for (let i = 0; i < stores.length; i++) {
             const store = stores[i];
 
             try {
                 const detail = await fetchStoreDetail(store.view_uid);
-                const distance = (detail.origin_lat && detail.origin_lng)
-                    ? getDistance(userCoords.lat, userCoords.lng, detail.origin_lat, detail.origin_lng)
+
+                const lat = detail.origin_lat ? parseFloat(detail.origin_lat) : null;
+                const lng = detail.origin_lng ? parseFloat(detail.origin_lng) : null;
+                const distance = (lat && lng)
+                    ? getDistance(userCoords.lat, userCoords.lng, lat, lng)
                     : null;
 
                 const category = getStoreCategory(store.title);
 
-                const storeData = {
+                batch.push({
                     view_uid: store.view_uid,
-                    title: store.title,
-                    image: store.image,
+                    title: store.title || '',
+                    image: store.image || '',
                     content: detail.content || '',
-                    is_open: detail.is_open,
+                    origin_address: detail.origin_address || '',
+                    origin_lat: lat,
+                    origin_lng: lng,
+                    distance,
+                    is_open: detail.is_open ?? 1,
                     close_status: detail.close_status || '',
                     close_time: detail.close_time || '',
-                    origin_address: detail.origin_address || '',
-                    origin_lat: detail.origin_lat,
-                    origin_lng: detail.origin_lng,
-                    link_view: store.link_view,
-                    distance,
-                    seller_rating: detail.seller_rating || 4.5,
-                    category: category
-                };
+                    seller_rating: parseFloat(detail.seller_rating) || 4.8,
+                    link_view: store.link_view || '',
+                    category // ← kategori sudah benar di sini
+                });
 
-                send('store', storeData);
-                processed++;
+                totalDone++;
+                console.log(`[${totalDone}/${stores.length}] ${store.title} → ${category}`);
 
-                console.log(`  ✅ [${processed}/${stores.length}] ${store.title} (${category}) — ${distance?.toFixed(2) || '?'} km`);
+                // Kirim batch setiap 3 toko (atau toko terakhir)
+                if (batch.length >= BATCH_SIZE || i === stores.length - 1) {
+                    send('batch', {
+                        stores: batch,
+                        progress: { done: totalDone, total: stores.length }
+                    });
+                    batch = [];
+                }
 
             } catch (err) {
-                console.log(`  ⚠️ Gagal load ${store.title}: ${err.message}`);
-                send('store_error', { view_uid: store.view_uid, title: store.title, error: err.message });
-            }
+                console.warn(`⚠️ Skip ${store.title}: ${err.message}`);
+                totalDone++;
 
-            // Delay kecil agar tidak overload
-            await new Promise(resolve => setTimeout(resolve, 100));
+                // Tetap kirim store dengan data minimal agar tidak hilang
+                batch.push({
+                    view_uid: store.view_uid,
+                    title: store.title || '',
+                    image: store.image || '',
+                    content: '',
+                    origin_address: '',
+                    origin_lat: null,
+                    origin_lng: null,
+                    distance: null,
+                    is_open: 1,
+                    close_status: '',
+                    close_time: '',
+                    seller_rating: 4.8,
+                    link_view: store.link_view || '',
+                    category: getStoreCategory(store.title),
+                    _error: true
+                });
+
+                if (batch.length >= BATCH_SIZE || i === stores.length - 1) {
+                    send('batch', {
+                        stores: batch,
+                        progress: { done: totalDone, total: stores.length }
+                    });
+                    batch = [];
+                }
+            }
         }
 
-        send('done', { total: processed });
-        console.log(`✅ Stream toko selesai — ${processed} toko dikirim`);
+        send('done', { total: totalDone });
+        console.log(`✅ Stream selesai — ${totalDone} toko`);
         res.end();
 
-    } catch (error) {
-        console.error('❌ Stream error:', error.message);
-        send('error', { message: error.message });
+    } catch (err) {
+        console.error('❌ Stream error:', err.message);
+        send('error', { message: err.message });
         res.end();
     }
 });
 
-// ─────────────────────────────────────────────────────────────
-// ENDPOINT LAMA: /api/all-stores (untuk kompatibilitas)
-// ─────────────────────────────────────────────────────────────
+// ─── ENDPOINT LAMA (kompatibilitas) ───────────────────────────
 app.get('/api/all-stores', async (req, res) => {
     try {
-        let userLat = parseFloat(req.query.lat);
-        let userLng = parseFloat(req.query.lng);
+        const userLat = parseFloat(req.query.lat);
+        const userLng = parseFloat(req.query.lng);
         const userCoords = (!isNaN(userLat) && !isNaN(userLng))
             ? { lat: userLat, lng: userLng }
-            : defaultCoords;
+            : DEFAULT_COORDS;
 
-        const [backendStores, uwarungStores] = await Promise.all([
-            fetchAllStoresFromComponent(STORE_COMPONENT_UID),
-            fetchAllStoresFromComponent(UWARUNG_COMPONENT_UID)
-        ]);
-
-        const mergedMap = new Map();
-        [...backendStores, ...uwarungStores].forEach(store => {
-            if (!mergedMap.has(store.view_uid)) {
-                mergedMap.set(store.view_uid, store);
-            }
-        });
-
-        const stores = Array.from(mergedMap.values());
-        const storesWithDetail = [];
+        const stores = await fetchAllStoresFromUWarung();
+        const result = [];
 
         for (const store of stores) {
             try {
                 const detail = await fetchStoreDetail(store.view_uid);
-                const distance = (detail.origin_lat && detail.origin_lng)
-                    ? getDistance(userCoords.lat, userCoords.lng, detail.origin_lat, detail.origin_lng)
-                    : null;
-                storesWithDetail.push({
+                const lat = detail.origin_lat ? parseFloat(detail.origin_lat) : null;
+                const lng = detail.origin_lng ? parseFloat(detail.origin_lng) : null;
+                result.push({
                     view_uid: store.view_uid,
-                    title: store.title,
-                    image: store.image,
+                    title: store.title || '',
+                    image: store.image || '',
                     content: detail.content || '',
-                    is_open: detail.is_open,
+                    origin_address: detail.origin_address || '',
+                    origin_lat: lat,
+                    origin_lng: lng,
+                    distance: (lat && lng) ? getDistance(userCoords.lat, userCoords.lng, lat, lng) : null,
+                    is_open: detail.is_open ?? 1,
                     close_status: detail.close_status || '',
                     close_time: detail.close_time || '',
-                    origin_address: detail.origin_address || '',
-                    origin_lat: detail.origin_lat,
-                    origin_lng: detail.origin_lng,
-                    link_view: store.link_view,
-                    distance,
-                    seller_rating: detail.seller_rating,
+                    seller_rating: parseFloat(detail.seller_rating) || 4.8,
+                    link_view: store.link_view || '',
                     category: getStoreCategory(store.title)
                 });
             } catch {
-                storesWithDetail.push({
+                result.push({
                     view_uid: store.view_uid,
-                    title: store.title,
-                    image: store.image,
-                    content: '',
-                    is_open: 0,
-                    close_status: 'Gagal load',
-                    origin_address: '',
-                    origin_lat: null,
-                    origin_lng: null,
-                    link_view: store.link_view,
-                    distance: null,
+                    title: store.title || '',
+                    image: store.image || '',
+                    content: '', origin_address: '', origin_lat: null, origin_lng: null,
+                    distance: null, is_open: 1, close_status: '', close_time: '',
+                    seller_rating: 4.8, link_view: store.link_view || '',
                     category: getStoreCategory(store.title)
                 });
             }
         }
 
-        storesWithDetail.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
-        res.json({ success: true, stores: storesWithDetail, userCoords });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        result.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
+        res.json({ success: true, stores: result, userCoords });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+app.get('/api/store/:viewUid', async (req, res) => {
+    try {
+        const detail = await fetchStoreDetail(req.params.viewUid);
+        res.json({ success: true, data: detail });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`🚀 Backend berjalan di port ${PORT}`);
-    console.log(`   📡 SSE Stream: GET /api/stores-stream?lat=...&lng=...`);
-    console.log(`   📦 JSON:      GET /api/all-stores?lat=...&lng=...`);
+    console.log(`\n🚀 Server berjalan di port ${PORT}`);
+    console.log(`\n📡 ENDPOINTS:`);
+    console.log(`   GET /api/stores-stream?lat=...&lng=...  ← SSE, 3 toko per batch`);
+    console.log(`   GET /api/all-stores?lat=...&lng=...     ← JSON biasa`);
+    console.log(`   GET /api/store/:viewUid                 ← detail 1 toko\n`);
 });
