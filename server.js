@@ -77,7 +77,7 @@ async function fetchAllMenusFromComponent() {
     return allMenus;
 }
 
-// Ambil detail toko
+// Ambil detail toko (mengandung origin_address)
 async function fetchStoreDetail(viewUid) {
     const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}?codename=${CODENAME}`;
     const response = await axios.get(url, {
@@ -135,7 +135,7 @@ app.get('/api/all-stores', async (req, res) => {
                     is_open: detail.is_open,
                     close_status: detail.close_status || '',
                     close_time: detail.close_time || '',
-                    origin_address: detail.origin_address || '',
+                    origin_address: detail.origin_address || '',  // ✅ origin_address diambil
                     origin_lat: detail.origin_lat,
                     origin_lng: detail.origin_lng,
                     link_view: store.link_view,
@@ -161,6 +161,43 @@ app.get('/api/all-stores', async (req, res) => {
 
         storesWithDetail.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
         res.json({ success: true, stores: storesWithDetail, userCoords });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// ENDPOINT KHUSUS: /api/store/:viewUid (untuk mengambil detail satu toko)
+// ─────────────────────────────────────────────────────────────
+app.get('/api/store/:viewUid', async (req, res) => {
+    try {
+        const { viewUid } = req.params;
+        const detail = await fetchStoreDetail(viewUid);
+
+        // Ambil data yang diperlukan termasuk origin_address
+        const storeData = {
+            success: true,
+            data: {
+                view_uid: detail.view_uid,
+                title: detail.title,
+                content: detail.content,
+                origin_address: detail.origin_address || '',  // ✅ origin_address diambil
+                origin_lat: detail.origin_lat,
+                origin_lng: detail.origin_lng,
+                set_origin_flag: detail.set_origin_flag,
+                is_open: detail.is_open,
+                close_status: detail.close_status,
+                working_hour: detail.working_hour,
+                image: detail.image,
+                seller_rating: detail.seller_rating,
+                price: detail.price,
+                weight: detail.weight,
+                expedition: detail.expedition,
+                max_distance: detail.max_distance
+            }
+        };
+
+        res.json(storeData);
     } catch (error) {
         res.status(500).json({ success: false, error: error.message });
     }
@@ -247,6 +284,7 @@ app.get('/api/menus-stream', async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────
 // ENDPOINT BARU 2: /api/stores-stream  →  Server-Sent Events untuk TOKO
+// (dengan origin_address)
 // ─────────────────────────────────────────────────────────────
 app.get('/api/stores-stream', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -298,7 +336,7 @@ app.get('/api/stores-stream', async (req, res) => {
                             is_open: detail.is_open,
                             close_status: detail.close_status || '',
                             close_time: detail.close_time || '',
-                            origin_address: detail.origin_address || '',
+                            origin_address: detail.origin_address || '',  // ✅ origin_address diambil
                             origin_lat: detail.origin_lat,
                             origin_lng: detail.origin_lng,
                             link_view: store.link_view,
@@ -307,6 +345,7 @@ app.get('/api/stores-stream', async (req, res) => {
                         };
 
                         console.log(`  ✅ [${++index}/${stores.length}] ${store.title} — ${distance?.toFixed(2)} km`);
+                        console.log(`      📍 Alamat: ${storeData.origin_address.substring(0, 50)}...`); // Log alamat
                         send('store', storeData);
                     } catch (err) {
                         send('store', {
@@ -384,11 +423,36 @@ app.get('/api/all-menus', async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────
+// ENDPOINT UNTUK MENDAPATKAN ORIGIN_ADDRESS SAJA (lightweight)
+// ─────────────────────────────────────────────────────────────
+app.get('/api/store/:viewUid/address', async (req, res) => {
+    try {
+        const { viewUid } = req.params;
+        const detail = await fetchStoreDetail(viewUid);
+
+        res.json({
+            success: true,
+            data: {
+                view_uid: detail.view_uid,
+                title: detail.title,
+                origin_address: detail.origin_address || '',
+                origin_lat: detail.origin_lat,
+                origin_lng: detail.origin_lng
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.listen(PORT, () => {
     console.log(`🚀 Backend berjalan di port ${PORT}`);
     console.log(`\n📦 ENDPOINT TERSEDIA:`);
-    console.log(`   🏪 Toko (SSE)  : GET /api/stores-stream?lat=...&lng=...`);
-    console.log(`   🏪 Toko (JSON) : GET /api/all-stores?lat=...&lng=...`);
-    console.log(`   🍽️  Menu (SSE)  : GET /api/menus-stream`);
-    console.log(`   🍽️  Menu (JSON) : GET /api/all-menus`);
+    console.log(`   🏪 Toko (SSE)       : GET /api/stores-stream?lat=...&lng=...`);
+    console.log(`   🏪 Toko (JSON)      : GET /api/all-stores?lat=...&lng=...`);
+    console.log(`   🏪 Detail Toko      : GET /api/store/:viewUid`);
+    console.log(`   🏪 Alamat Toko      : GET /api/store/:viewUid/address`);
+    console.log(`   🍽️  Menu (SSE)      : GET /api/menus-stream`);
+    console.log(`   🍽️  Menu (JSON)     : GET /api/all-menus`);
 });
