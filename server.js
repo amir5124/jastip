@@ -9,15 +9,22 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Konfigurasi dari Jagel
-const STORE_COMPONENT_UID = '618e70133c5ca';  // untuk toko (all-stores)
-const UWARUNG_COMPONENT_UID = '618b7f0c383e4'; // UWarung - daftar toko
+// ─────────────────────────────────────────────────────────────
+// KONFIGURASI
+// ─────────────────────────────────────────────────────────────
+const STORE_COMPONENT_UID = '618e70133c5ca';   // all-stores (Jastip)
+const UWARUNG_COMPONENT_UID = '618b7f0c383e4';  // UWarung - daftar toko
 const CODENAME = 'iknlinku';
+const BATCH_SIZE = 3; // Jumlah toko per batch SSE
 
 // Default koordinat (Sepaku, Kalimantan Timur)
 const defaultCoords = { lat: -0.975, lng: 116.786 };
 
-// Hitung jarak haversine (km)
+// ─────────────────────────────────────────────────────────────
+// UTILITAS
+// ─────────────────────────────────────────────────────────────
+
+/** Hitung jarak haversine (km) */
 function getDistance(lat1, lon1, lat2, lon2) {
     const R = 6371;
     const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -29,168 +36,362 @@ function getDistance(lat1, lon1, lat2, lon2) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// Ambil semua toko dari component UWarung (pagination)
-async function fetchAllStoresFromUWarung() {
-    let allStores = [];
-    let currentPage = 1;
-    let lastPage = 1;
-    do {
-        const url = `https://app.jagel.id/api/v2/customer/component/${UWARUNG_COMPONENT_UID}?codename=${CODENAME}&page=${currentPage}&app_mode=1&per_page=24`;
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0',
-                'Origin': 'https://app.linku.co.id',
-                'Referer': 'https://app.linku.co.id/',
-                'Accept': 'application/json'
-            }
-        });
-        if (!response.data.success) throw new Error('UWarung Component API error');
-        const lists = response.data.data.lists;
-        allStores.push(...(lists.data || []));
-        lastPage = lists.last_page;
-        currentPage++;
-    } while (currentPage <= lastPage);
-    return allStores;
+/** Parse koordinat dari query string */
+function parseUserCoords(query) {
+    const lat = parseFloat(query.lat);
+    const lng = parseFloat(query.lng);
+    return (!isNaN(lat) && !isNaN(lng)) ? { lat, lng } : defaultCoords;
 }
 
-// Ambil semua toko dari component store (pagination)
-async function fetchAllStoresFromComponent() {
-    let allStores = [];
-    let currentPage = 1;
-    let lastPage = 1;
-    do {
-        const url = `https://app.jagel.id/api/v2/customer/component/${STORE_COMPONENT_UID}?codename=${CODENAME}&page=${currentPage}&app_mode=1&per_page=24`;
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0',
-                'Origin': 'https://app.linku.co.id',
-                'Referer': 'https://app.linku.co.id/',
-                'Accept': 'application/json'
-            }
-        });
-        if (!response.data.success) throw new Error('Component API error');
-        const lists = response.data.data.lists;
-        allStores.push(...(lists.data || []));
-        lastPage = lists.last_page;
-        currentPage++;
-    } while (currentPage <= lastPage);
-    return allStores;
+/** Helper header default untuk request ke Jagel */
+const jagelHeaders = {
+    'User-Agent': 'Mozilla/5.0',
+    'Origin': 'https://app.linku.co.id',
+    'Referer': 'https://app.linku.co.id/',
+    'Accept': 'application/json'
+};
+
+/** Bagi array menjadi chunk ukuran n */
+function chunk(arr, n) {
+    const result = [];
+    for (let i = 0; i < arr.length; i += n) result.push(arr.slice(i, i + n));
+    return result;
 }
 
-// Ambil detail toko (mengandung origin_address)
+// ─────────────────────────────────────────────────────────────
+// FUNGSI FETCH DATA DARI JAGEL
+// ─────────────────────────────────────────────────────────────
+
+/** Ambil semua toko dari component (pagination otomatis) */
+async function fetchAllStoresFromComponent(componentUid) {
+    let all = [], page = 1, lastPage = 1;
+    do {
+        const url = `https://app.jagel.id/api/v2/customer/component/${componentUid}`
+            + `?codename=${CODENAME}&page=${page}&app_mode=1&per_page=24`;
+        const { data } = await axios.get(url, { headers: jagelHeaders });
+        if (!data.success) throw new Error(`Component API error (uid=${componentUid})`);
+        const lists = data.data.lists;
+        all.push(...(lists.data || []));
+        lastPage = lists.last_page;
+        page++;
+    } while (page <= lastPage);
+    return all;
+}
+
+/** Ambil detail satu toko (berisi origin_address, rating, dll.) */
 async function fetchStoreDetail(viewUid) {
     const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}?codename=${CODENAME}`;
-    const response = await axios.get(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0',
-            'Origin': 'https://app.linku.co.id',
-            'Referer': 'https://app.linku.co.id/',
-            'Accept': 'application/json'
-        }
-    });
-    if (!response.data.success) throw new Error(`Detail API error for ${viewUid}`);
-    return response.data.data;
+    const { data } = await axios.get(url, { headers: jagelHeaders });
+    if (!data.success) throw new Error(`Detail API error for ${viewUid}`);
+    return data.data;
 }
 
-// Ambil semua produk dari sebuah toko
+/** Ambil semua produk dari satu toko */
 async function fetchStoreProducts(viewUid) {
     try {
-        // Endpoint untuk mengambil produk dalam toko
-        const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}/product?codename=${CODENAME}&page=1&per_page=100`;
-        const response = await axios.get(url, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0',
-                'Origin': 'https://app.linku.co.id',
-                'Referer': 'https://app.linku.co.id/',
-                'Accept': 'application/json'
-            }
-        });
-        if (response.data.success && response.data.data && response.data.data.products) {
-            return response.data.data.products.data || [];
-        }
+        const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}/product`
+            + `?codename=${CODENAME}&page=1&per_page=100`;
+        const { data } = await axios.get(url, { headers: jagelHeaders });
+        if (data.success && data.data?.products) return data.data.products.data || [];
         return [];
-    } catch (error) {
-        console.log(`Tidak bisa ambil produk untuk toko ${viewUid}: ${error.message}`);
+    } catch (err) {
+        console.log(`⚠️  Produk ${viewUid}: ${err.message}`);
         return [];
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-// ENDPOINT BARU: /api/all-products - Mengambil semua produk dari semua toko
-// Setiap produk memiliki origin_address dari tokonya
-// ─────────────────────────────────────────────────────────────
-app.get('/api/all-products', async (req, res) => {
-    try {
-        let userLat = parseFloat(req.query.lat);
-        let userLng = parseFloat(req.query.lng);
-        const userCoords = (!isNaN(userLat) && !isNaN(userLng))
-            ? { lat: userLat, lng: userLng }
-            : defaultCoords;
+/**
+ * Proses satu batch toko (paralel) → kembalikan array hasil.
+ * @param {Array}   storeList   - Array toko mentah dari component API
+ * @param {Object}  userCoords  - { lat, lng }
+ * @param {string}  mode        - 'stores' | 'products'
+ */
+async function processBatch(storeList, userCoords, mode) {
+    return Promise.all(storeList.map(async (store) => {
+        try {
+            const detail = await fetchStoreDetail(store.view_uid);
+            const distance = (detail.origin_lat && detail.origin_lng)
+                ? getDistance(userCoords.lat, userCoords.lng, detail.origin_lat, detail.origin_lng)
+                : null;
 
-        console.log('📍 Mengambil semua toko dari UWarung...');
-
-        // 1. Ambil semua toko dari UWarung
-        const stores = await fetchAllStoresFromUWarung();
-        console.log(`📋 Ditemukan ${stores.length} toko`);
-
-        const allProducts = [];
-
-        // 2. Untuk setiap toko, ambil detail (termasuk origin_address) dan produknya
-        for (let i = 0; i < stores.length; i++) {
-            const store = stores[i];
-            console.log(`🔄 Memproses toko ${i + 1}/${stores.length}: ${store.title}`);
-
-            try {
-                // Ambil detail toko (termasuk origin_address)
-                const storeDetail = await fetchStoreDetail(store.view_uid);
-
-                // Ambil produk dari toko ini
-                const products = await fetchStoreProducts(store.view_uid);
-
-                // Hitung jarak toko dari user
-                const storeDistance = (storeDetail.origin_lat && storeDetail.origin_lng)
-                    ? getDistance(userCoords.lat, userCoords.lng, storeDetail.origin_lat, storeDetail.origin_lng)
-                    : null;
-
-                // Untuk setiap produk, tambahkan informasi toko (termasuk origin_address)
-                for (const product of products) {
-                    allProducts.push({
-                        // Informasi produk
-                        product_view_uid: product.view_uid,
-                        product_title: product.title,
-                        product_image: product.image,
-                        product_price: product.price,
-                        product_content: product.content || '',
-                        product_category: product.category_name || '',
-
-                        // Informasi toko (dengan origin_address)
-                        store_view_uid: store.view_uid,
-                        store_title: store.title,
-                        store_image: store.image,
-                        store_origin_address: storeDetail.origin_address || '',
-                        store_origin_lat: storeDetail.origin_lat,
-                        store_origin_lng: storeDetail.origin_lng,
-                        store_distance: storeDistance,
-                        store_rating: storeDetail.seller_rating,
-                        store_is_open: storeDetail.is_open,
-
-                        // Link
-                        link_view: store.link_view
-                    });
-                }
-
-                console.log(`   ✅ Mendapatkan ${products.length} produk dari ${store.title}`);
-
-            } catch (error) {
-                console.log(`   ⚠️ Gagal memproses ${store.title}: ${error.message}`);
+            if (mode === 'stores') {
+                return {
+                    ok: true,
+                    data: {
+                        view_uid: store.view_uid,
+                        title: store.title,
+                        image: store.image,
+                        content: detail.content || '',
+                        is_open: detail.is_open,
+                        close_status: detail.close_status || '',
+                        close_time: detail.close_time || '',
+                        origin_address: detail.origin_address || '',
+                        origin_lat: detail.origin_lat,
+                        origin_lng: detail.origin_lng,
+                        link_view: store.link_view,
+                        distance,
+                        seller_rating: detail.seller_rating
+                    }
+                };
             }
+
+            // mode === 'products'
+            const products = await fetchStoreProducts(store.view_uid);
+            const productList = products.map(p => ({
+                product_view_uid: p.view_uid,
+                product_title: p.title,
+                product_image: p.image,
+                product_price: p.price,
+                product_content: p.content || '',
+                product_category: p.category_name || '',
+                store_view_uid: store.view_uid,
+                store_title: store.title,
+                store_image: store.image,
+                store_origin_address: detail.origin_address || '',
+                store_origin_lat: detail.origin_lat,
+                store_origin_lng: detail.origin_lng,
+                store_distance: distance,
+                store_rating: detail.seller_rating,
+                store_is_open: detail.is_open,
+                link_view: store.link_view
+            }));
+
+            return { ok: true, store_title: store.title, data: productList };
+        } catch (err) {
+            return { ok: false, store_title: store.title, error: err.message };
+        }
+    }));
+}
+
+// ─────────────────────────────────────────────────────────────
+// HELPER SSE
+// ─────────────────────────────────────────────────────────────
+
+/** Setup header SSE & kembalikan fungsi send() */
+function setupSSE(res) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    res.flushHeaders();
+
+    return (event, data) => {
+        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+    };
+}
+
+// ─────────────────────────────────────────────────────────────
+// SSE: /api/stores-stream?source=jastip|uwarung&lat=&lng=
+//
+// Mengirim batch BATCH_SIZE toko sekaligus via event "batch_stores".
+// Event-event:
+//   meta          → info awal (total_stores, source, userCoords)
+//   batch_stores  → array toko (maks BATCH_SIZE item)
+//   progress      → progres setelah tiap batch
+//   done          → selesai
+//   error         → fatal error
+// ─────────────────────────────────────────────────────────────
+app.get('/api/stores-stream', async (req, res) => {
+    const send = setupSSE(res);
+    req.on('close', () => res.end());
+
+    try {
+        const userCoords = parseUserCoords(req.query);
+        const source = req.query.source === 'jastip' ? 'jastip' : 'uwarung';
+        const uid = source === 'jastip' ? STORE_COMPONENT_UID : UWARUNG_COMPONENT_UID;
+
+        console.log(`📡 [stores-stream] source=${source}`);
+
+        const stores = await fetchAllStoresFromComponent(uid);
+        const batches = chunk(stores, BATCH_SIZE);
+
+        send('meta', {
+            total_stores: stores.length,
+            total_batches: batches.length,
+            batch_size: BATCH_SIZE,
+            source,
+            userCoords
+        });
+
+        let processedCount = 0;
+
+        for (let bi = 0; bi < batches.length; bi++) {
+            const batch = batches[bi];
+            const results = await processBatch(batch, userCoords, 'stores');
+
+            // Pisahkan sukses dan gagal
+            const successItems = results.filter(r => r.ok).map(r => r.data);
+            const failedItems = results.filter(r => !r.ok);
+
+            // Kirim batch data toko yang berhasil
+            if (successItems.length > 0) {
+                send('batch_stores', {
+                    batch_index: bi + 1,
+                    total_batches: batches.length,
+                    stores: successItems
+                });
+            }
+
+            // Kirim error per toko yang gagal
+            failedItems.forEach(f => {
+                send('error_store', { store_name: f.store_title, error: f.error });
+            });
+
+            processedCount += batch.length;
+
+            send('progress', {
+                batch_index: bi + 1,
+                total_batches: batches.length,
+                processed_stores: processedCount,
+                total_stores: stores.length,
+                percent: Math.round((processedCount / stores.length) * 100)
+            });
+
+            console.log(`✅ [stores-stream] batch ${bi + 1}/${batches.length} — ${successItems.length} toko dikirim`);
         }
 
-        // Urutkan berdasarkan jarak terdekat
+        send('done', {
+            total_stores: stores.length,
+            total_batches: batches.length,
+            source
+        });
+        res.end();
+
+    } catch (err) {
+        console.error('❌ [stores-stream]', err.message);
+        send('error', { message: err.message });
+        res.end();
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// SSE: /api/all-products-stream?lat=&lng=
+//
+// Mengirim batch BATCH_SIZE toko sekaligus, dan per-batch
+// mengirim semua produk dari toko-toko tersebut via "batch_products".
+// Event-event:
+//   meta            → info awal
+//   batch_products  → array produk dari batch toko
+//   progress        → progres setelah tiap batch
+//   done            → selesai
+//   error           → fatal error
+// ─────────────────────────────────────────────────────────────
+app.get('/api/all-products-stream', async (req, res) => {
+    const send = setupSSE(res);
+    req.on('close', () => res.end());
+
+    try {
+        const userCoords = parseUserCoords(req.query);
+
+        console.log(`📡 [all-products-stream] koordinat: ${userCoords.lat}, ${userCoords.lng}`);
+
+        const stores = await fetchAllStoresFromComponent(UWARUNG_COMPONENT_UID);
+        const batches = chunk(stores, BATCH_SIZE);
+
+        send('meta', {
+            total_stores: stores.length,
+            total_batches: batches.length,
+            batch_size: BATCH_SIZE,
+            userCoords
+        });
+
+        let totalProducts = 0;
+        let processedStores = 0;
+
+        for (let bi = 0; bi < batches.length; bi++) {
+            const batch = batches[bi];
+            const results = await processBatch(batch, userCoords, 'products');
+
+            const batchProducts = [];
+
+            results.forEach(r => {
+                if (r.ok) {
+                    batchProducts.push(...r.data);
+                    console.log(`  ✅ ${r.store_title} → ${r.data.length} produk`);
+                } else {
+                    send('error_store', { store_name: r.store_title, error: r.error });
+                    console.log(`  ⚠️  ${r.store_title}: ${r.error}`);
+                }
+            });
+
+            if (batchProducts.length > 0) {
+                // Urutkan produk dalam batch berdasarkan jarak toko terdekat
+                batchProducts.sort((a, b) => (a.store_distance ?? Infinity) - (b.store_distance ?? Infinity));
+
+                send('batch_products', {
+                    batch_index: bi + 1,
+                    total_batches: batches.length,
+                    products: batchProducts,
+                    count: batchProducts.length
+                });
+
+                totalProducts += batchProducts.length;
+            }
+
+            processedStores += batch.length;
+
+            send('progress', {
+                batch_index: bi + 1,
+                total_batches: batches.length,
+                processed_stores: processedStores,
+                total_stores: stores.length,
+                total_products_so_far: totalProducts,
+                percent: Math.round((processedStores / stores.length) * 100)
+            });
+
+            console.log(`✅ [all-products-stream] batch ${bi + 1}/${batches.length} — ${batchProducts.length} produk dikirim`);
+        }
+
+        send('done', {
+            total_products: totalProducts,
+            total_stores: stores.length,
+            total_batches: batches.length
+        });
+        res.end();
+
+    } catch (err) {
+        console.error('❌ [all-products-stream]', err.message);
+        send('error', { message: err.message });
+        res.end();
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
+// ENDPOINT JSON BIASA (non-SSE) — tetap dipertahankan
+// ─────────────────────────────────────────────────────────────
+
+/** GET /api/all-stores?lat=&lng= */
+app.get('/api/all-stores', async (req, res) => {
+    try {
+        const userCoords = parseUserCoords(req.query);
+        const stores = await fetchAllStoresFromComponent(STORE_COMPONENT_UID);
+        const results = await processBatch(stores, userCoords, 'stores');
+        const storeList = results.map(r => r.ok ? r.data : {
+            view_uid: null,
+            title: r.store_title,
+            is_open: 0,
+            close_status: 'Gagal load',
+            origin_address: '',
+            origin_lat: null,
+            origin_lng: null,
+            distance: null
+        });
+        storeList.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
+        res.json({ success: true, stores: storeList, userCoords });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
+/** GET /api/all-products?lat=&lng= */
+app.get('/api/all-products', async (req, res) => {
+    try {
+        const userCoords = parseUserCoords(req.query);
+        const stores = await fetchAllStoresFromComponent(UWARUNG_COMPONENT_UID);
+        const results = await processBatch(stores, userCoords, 'products');
+        const allProducts = results.flatMap(r => r.ok ? r.data : []);
         allProducts.sort((a, b) => (a.store_distance ?? Infinity) - (b.store_distance ?? Infinity));
-
-        console.log(`✅ Selesai! Total ${allProducts.length} produk ditemukan`);
-
         res.json({
             success: true,
             total_products: allProducts.length,
@@ -198,182 +399,28 @@ app.get('/api/all-products', async (req, res) => {
             products: allProducts,
             userCoords
         });
-
-    } catch (error) {
-        console.error('❌ Error:', error.message);
-        res.status(500).json({ success: false, error: error.message });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// ─────────────────────────────────────────────────────────────
-// ENDPOINT: /api/all-products-stream - Server-Sent Events untuk produk
-// ─────────────────────────────────────────────────────────────
-app.get('/api/all-products-stream', async (req, res) => {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders();
-
-    const send = (event, data) => {
-        res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-        if (typeof res.flush === 'function') res.flush();
-    };
-
-    req.on('close', () => res.end());
-
+/** GET /api/stores-from-uwarung */
+app.get('/api/stores-from-uwarung', async (req, res) => {
     try {
-        const userLat = parseFloat(req.query.lat);
-        const userLng = parseFloat(req.query.lng);
-        const userCoords = (!isNaN(userLat) && !isNaN(userLng))
-            ? { lat: userLat, lng: userLng }
-            : defaultCoords;
-
-        console.log(`📍 Stream produk dimulai — koordinat: ${userCoords.lat}, ${userCoords.lng}`);
-
-        // Ambil semua toko dari UWarung
-        const stores = await fetchAllStoresFromUWarung();
-        console.log(`📋 Total toko: ${stores.length}`);
-
-        send('meta', { total_stores: stores.length, userCoords, type: 'products' });
-
-        let totalProducts = 0;
-
-        // Proses setiap toko satu per satu
-        for (let i = 0; i < stores.length; i++) {
-            const store = stores[i];
-
-            try {
-                const storeDetail = await fetchStoreDetail(store.view_uid);
-                const products = await fetchStoreProducts(store.view_uid);
-
-                const storeDistance = (storeDetail.origin_lat && storeDetail.origin_lng)
-                    ? getDistance(userCoords.lat, userCoords.lng, storeDetail.origin_lat, storeDetail.origin_lng)
-                    : null;
-
-                // Kirim event untuk setiap produk
-                for (const product of products) {
-                    const productData = {
-                        product_view_uid: product.view_uid,
-                        product_title: product.title,
-                        product_image: product.image,
-                        product_price: product.price,
-                        product_content: product.content || '',
-                        product_category: product.category_name || '',
-                        store_view_uid: store.view_uid,
-                        store_title: store.title,
-                        store_image: store.image,
-                        store_origin_address: storeDetail.origin_address || '',
-                        store_origin_lat: storeDetail.origin_lat,
-                        store_origin_lng: storeDetail.origin_lng,
-                        store_distance: storeDistance,
-                        store_rating: storeDetail.seller_rating,
-                        store_is_open: storeDetail.is_open,
-                        link_view: store.link_view
-                    };
-
-                    send('product', productData);
-                    totalProducts++;
-                }
-
-                console.log(`✅ [${i + 1}/${stores.length}] ${store.title} → ${products.length} produk dikirim`);
-
-                // Kirim progress
-                send('progress', {
-                    store_index: i + 1,
-                    total_stores: stores.length,
-                    store_name: store.title,
-                    products_from_store: products.length,
-                    total_products_so_far: totalProducts
-                });
-
-            } catch (error) {
-                console.log(`⚠️ Gagal memproses ${store.title}: ${error.message}`);
-                send('error_store', {
-                    store_name: store.title,
-                    error: error.message
-                });
-            }
-        }
-
-        send('done', { total_products: totalProducts, total_stores: stores.length });
-        console.log(`✅ Stream produk selesai — ${totalProducts} produk dikirim dari ${stores.length} toko`);
-        res.end();
-
-    } catch (error) {
-        console.error('❌ Stream produk error:', error.message);
-        send('error', { message: error.message });
-        res.end();
+        const userCoords = parseUserCoords(req.query);
+        const stores = await fetchAllStoresFromComponent(UWARUNG_COMPONENT_UID);
+        const results = await processBatch(stores, userCoords, 'stores');
+        const storeList = results.filter(r => r.ok).map(r => r.data);
+        res.json({ success: true, total_stores: storeList.length, stores: storeList });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// ─────────────────────────────────────────────────────────────
-// ENDPOINT LAMA: /api/all-stores (untuk kompatibilitas)
-// ─────────────────────────────────────────────────────────────
-app.get('/api/all-stores', async (req, res) => {
-    try {
-        let userLat = parseFloat(req.query.lat);
-        let userLng = parseFloat(req.query.lng);
-        const userCoords = (!isNaN(userLat) && !isNaN(userLng))
-            ? { lat: userLat, lng: userLng }
-            : defaultCoords;
-
-        const stores = await fetchAllStoresFromComponent();
-        const storesWithDetail = [];
-
-        for (const store of stores) {
-            try {
-                const detail = await fetchStoreDetail(store.view_uid);
-                const distance = (detail.origin_lat && detail.origin_lng)
-                    ? getDistance(userCoords.lat, userCoords.lng, detail.origin_lat, detail.origin_lng)
-                    : null;
-                storesWithDetail.push({
-                    view_uid: store.view_uid,
-                    title: store.title,
-                    image: store.image,
-                    content: detail.content || '',
-                    is_open: detail.is_open,
-                    close_status: detail.close_status || '',
-                    close_time: detail.close_time || '',
-                    origin_address: detail.origin_address || '',
-                    origin_lat: detail.origin_lat,
-                    origin_lng: detail.origin_lng,
-                    link_view: store.link_view,
-                    distance,
-                    seller_rating: detail.seller_rating
-                });
-            } catch {
-                storesWithDetail.push({
-                    view_uid: store.view_uid,
-                    title: store.title,
-                    image: store.image,
-                    content: '',
-                    is_open: 0,
-                    close_status: 'Gagal load',
-                    origin_address: '',
-                    origin_lat: null,
-                    origin_lng: null,
-                    link_view: store.link_view,
-                    distance: null
-                });
-            }
-        }
-
-        storesWithDetail.sort((a, b) => (a.distance ?? Infinity) - (b.distance ?? Infinity));
-        res.json({ success: true, stores: storesWithDetail, userCoords });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
-// ─────────────────────────────────────────────────────────────
-// ENDPOINT: /api/store/:viewUid (detail toko)
-// ─────────────────────────────────────────────────────────────
+/** GET /api/store/:viewUid */
 app.get('/api/store/:viewUid', async (req, res) => {
     try {
-        const { viewUid } = req.params;
-        const detail = await fetchStoreDetail(viewUid);
-
+        const detail = await fetchStoreDetail(req.params.viewUid);
         res.json({
             success: true,
             data: {
@@ -395,91 +442,50 @@ app.get('/api/store/:viewUid', async (req, res) => {
                 max_distance: detail.max_distance
             }
         });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
-// ─────────────────────────────────────────────────────────────
-// ENDPOINT: /api/store/:viewUid/products (produk dari toko tertentu)
-// ─────────────────────────────────────────────────────────────
+/** GET /api/store/:viewUid/products */
 app.get('/api/store/:viewUid/products', async (req, res) => {
     try {
         const { viewUid } = req.params;
-        const storeDetail = await fetchStoreDetail(viewUid);
-        const products = await fetchStoreProducts(viewUid);
-
+        const [detail, products] = await Promise.all([
+            fetchStoreDetail(viewUid),
+            fetchStoreProducts(viewUid)
+        ]);
         res.json({
             success: true,
             store: {
-                view_uid: storeDetail.view_uid,
-                title: storeDetail.title,
-                origin_address: storeDetail.origin_address || '',
-                origin_lat: storeDetail.origin_lat,
-                origin_lng: storeDetail.origin_lng
+                view_uid: detail.view_uid,
+                title: detail.title,
+                origin_address: detail.origin_address || '',
+                origin_lat: detail.origin_lat,
+                origin_lng: detail.origin_lng
             },
-            products: products,
+            products,
             total_products: products.length
         });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
 // ─────────────────────────────────────────────────────────────
-// ENDPOINT: /api/stores-from-uwarung (daftar toko dari UWarung)
+// START SERVER
 // ─────────────────────────────────────────────────────────────
-app.get('/api/stores-from-uwarung', async (req, res) => {
-    try {
-        const stores = await fetchAllStoresFromUWarung();
-
-        // Ambil detail untuk setiap toko (termasuk origin_address)
-        const storesWithDetail = [];
-        for (const store of stores) {
-            try {
-                const detail = await fetchStoreDetail(store.view_uid);
-                storesWithDetail.push({
-                    view_uid: store.view_uid,
-                    title: store.title,
-                    image: store.image,
-                    origin_address: detail.origin_address || '',
-                    origin_lat: detail.origin_lat,
-                    origin_lng: detail.origin_lng,
-                    is_open: detail.is_open,
-                    seller_rating: detail.seller_rating,
-                    link_view: store.link_view
-                });
-            } catch (error) {
-                storesWithDetail.push({
-                    view_uid: store.view_uid,
-                    title: store.title,
-                    image: store.image,
-                    origin_address: '',
-                    origin_lat: null,
-                    origin_lng: null,
-                    is_open: 0,
-                    link_view: store.link_view
-                });
-            }
-        }
-
-        res.json({
-            success: true,
-            total_stores: storesWithDetail.length,
-            stores: storesWithDetail
-        });
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
-});
-
 app.listen(PORT, () => {
-    console.log(`🚀 Backend berjalan di port ${PORT}`);
-    console.log(`\n📦 ENDPOINT TERSEDIA:`);
-    console.log(`   🛍️  Semua Produk (JSON) : GET /api/all-products?lat=...&lng=...`);
-    console.log(`   🛍️  Semua Produk (SSE)  : GET /api/all-products-stream?lat=...&lng=...`);
-    console.log(`   🏪  Semua Toko (JSON)   : GET /api/all-stores?lat=...&lng=...`);
-    console.log(`   🏪  Toko dari UWarung   : GET /api/stores-from-uwarung`);
-    console.log(`   🏪  Detail Toko         : GET /api/store/:viewUid`);
-    console.log(`   🍽️  Produk Toko        : GET /api/store/:viewUid/products`);
+    console.log(`\n🚀 Server berjalan di port ${PORT}`);
+    console.log(`\n━━━ ENDPOINT SSE (Batch ${BATCH_SIZE} toko) ━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`  📡 Toko Jastip  (SSE)   : GET /api/stores-stream?source=jastip&lat=...&lng=...`);
+    console.log(`  📡 Toko UWarung (SSE)   : GET /api/stores-stream?source=uwarung&lat=...&lng=...`);
+    console.log(`  📡 Semua Produk (SSE)   : GET /api/all-products-stream?lat=...&lng=...`);
+    console.log(`\n━━━ ENDPOINT JSON (non-SSE) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`  🏪 Semua Toko Jastip    : GET /api/all-stores?lat=...&lng=...`);
+    console.log(`  🏪 Semua Toko UWarung   : GET /api/stores-from-uwarung?lat=...&lng=...`);
+    console.log(`  🛍️  Semua Produk        : GET /api/all-products?lat=...&lng=...`);
+    console.log(`  🏪 Detail Toko          : GET /api/store/:viewUid`);
+    console.log(`  🍽️  Produk Toko         : GET /api/store/:viewUid/products`);
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
 });
