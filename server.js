@@ -717,41 +717,8 @@ app.get('/api/store/:viewUid', async (req, res) => {
     }
 });
 
-/** GET /api/store/:viewUid/products */
-app.get('/api/store/:viewUid/products', async (req, res) => {
-    try {
-        const { viewUid } = req.params;
-        const [detail, products] = await Promise.all([
-            fetchStoreDetail(viewUid),
-            fetchStoreProducts(viewUid)
-        ]);
-        res.json({
-            success: true,
-            store: {
-                view_uid: detail.view_uid,
-                title: detail.title,
-                origin_address: detail.origin_address || '',
-                origin_lat: detail.origin_lat,
-                origin_lng: detail.origin_lng
-            },
-            products,
-            total_products: products.length
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-});
-
 // ─────────────────────────────────────────────────────────────
-// SSE: /api/store/:viewUid/menu-stream
-//
-// Streaming semua produk dari satu toko, dikelompokkan per kategori.
-// Event-event:
-//   meta      → info awal (total_categories, store_name)
-//   category  → satu kategori beserta produk-produknya
-//   progress  → progres loading
-//   done      → selesai
-//   error     → fatal error
+// SSE: /api/store/:viewUid/menu-stream (PERBAIKAN)
 // ─────────────────────────────────────────────────────────────
 app.get('/api/store/:viewUid/menu-stream', async (req, res) => {
     const send = setupSSE(res);
@@ -766,42 +733,8 @@ app.get('/api/store/:viewUid/menu-stream', async (req, res) => {
         // Ambil detail toko
         const storeDetail = await fetchStoreDetail(viewUid);
 
-        // Ambil semua produk toko
-        const products = await fetchStoreProducts(viewUid);
-
-        // Kelompokkan produk berdasarkan kategori
-        const categoryMap = new Map();
-
-        products.forEach(product => {
-            const catName = product.category_name || 'Lainnya';
-            const catKey = product.category_uid || catName;
-
-            if (!categoryMap.has(catKey)) {
-                categoryMap.set(catKey, {
-                    view_uid: catKey,
-                    title: catName,
-                    products: []
-                });
-            }
-
-            // Tambahkan jarak ke produk (dari toko)
-            const distance = (storeDetail.origin_lat && storeDetail.origin_lng)
-                ? getDistance(userCoords.lat, userCoords.lng, storeDetail.origin_lat, storeDetail.origin_lng)
-                : null;
-
-            categoryMap.get(catKey).products.push({
-                view_uid: product.view_uid,
-                title: product.title,
-                image: product.image,
-                price: product.price,
-                content: product.content || '',
-                category_name: product.category_name || '',
-                store_distance: distance
-            });
-        });
-
-        // Konversi ke array dan urutkan
-        const categories = Array.from(categoryMap.values());
+        // Ambil semua kategori dari toko
+        const categories = await fetchStoreCategories(viewUid);
 
         // Kirim meta info
         send('meta', {
@@ -810,29 +743,61 @@ app.get('/api/store/:viewUid/menu-stream', async (req, res) => {
             store_uid: viewUid
         });
 
-        // Kirim setiap kategori satu per satu (sebagai SSE event)
+        let totalProducts = 0;
+
+        // Proses setiap kategori
         for (let i = 0; i < categories.length; i++) {
             const category = categories[i];
 
+            // Ambil produk dalam kategori ini
+            const products = await fetchCategoryProducts(category.view_uid);
+
+            // Format produk
+            const formattedProducts = products.map(product => {
+                const distance = (storeDetail.origin_lat && storeDetail.origin_lng)
+                    ? getDistance(userCoords.lat, userCoords.lng, storeDetail.origin_lat, storeDetail.origin_lng)
+                    : null;
+
+                return {
+                    view_uid: product.view_uid,
+                    title: product.title,
+                    image: product.image,
+                    price: product.price || 0,
+                    content: product.content || '',
+                    category_name: category.title,
+                    store_distance: distance
+                };
+            });
+
+            totalProducts += formattedProducts.length;
+
+            // Kirim event category
             send('category', {
                 category_index: i + 1,
                 total_categories: categories.length,
-                category: category
+                category: {
+                    view_uid: category.view_uid,
+                    title: category.title,
+                    products: formattedProducts
+                }
             });
 
             send('progress', {
                 percent: Math.round(((i + 1) / categories.length) * 100),
                 current: i + 1,
-                total: categories.length
+                total: categories.length,
+                products_loaded: totalProducts
             });
 
+            console.log(`   ✅ ${category.title}: ${formattedProducts.length} produk`);
+
             // Delay kecil agar tidak overload
-            await new Promise(resolve => setTimeout(resolve, 50));
+            await new Promise(resolve => setTimeout(resolve, 100));
         }
 
         send('done', {
             total_categories: categories.length,
-            total_products: products.length
+            total_products: totalProducts
         });
         res.end();
 
@@ -843,15 +808,15 @@ app.get('/api/store/:viewUid/menu-stream', async (req, res) => {
     }
 });
 
-// GET /api/store/:viewUid/products?lat=&lng=
+// GET /api/store/:viewUid/products?lat=&lng= (PERBAIKAN)
 app.get('/api/store/:viewUid/products', async (req, res) => {
     try {
         const { viewUid } = req.params;
         const userCoords = parseUserCoords(req.query);
 
-        const [detail, products] = await Promise.all([
+        const [detail, categories] = await Promise.all([
             fetchStoreDetail(viewUid),
-            fetchStoreProducts(viewUid)
+            fetchStoreCategories(viewUid)
         ]);
 
         // Hitung jarak
@@ -859,19 +824,25 @@ app.get('/api/store/:viewUid/products', async (req, res) => {
             ? getDistance(userCoords.lat, userCoords.lng, detail.origin_lat, detail.origin_lng)
             : null;
 
-        // Format produk dengan info toko
-        const formattedProducts = products.map(p => ({
-            view_uid: p.view_uid,
-            title: p.title,
-            image: p.image,
-            price: p.price,
-            content: p.content || '',
-            product_category: p.category_name || '',
-            store_view_uid: detail.view_uid,
-            store_title: detail.title,
-            store_distance: distance,
-            store_is_open: detail.is_open
-        }));
+        // Ambil semua produk dari semua kategori
+        const allProducts = [];
+        for (const category of categories) {
+            const products = await fetchCategoryProducts(category.view_uid);
+            products.forEach(product => {
+                allProducts.push({
+                    view_uid: product.view_uid,
+                    title: product.title,
+                    image: product.image,
+                    price: product.price || 0,
+                    content: product.content || '',
+                    product_category: category.title,
+                    store_view_uid: detail.view_uid,
+                    store_title: detail.title,
+                    store_distance: distance,
+                    store_is_open: detail.is_open
+                });
+            });
+        }
 
         res.json({
             success: true,
@@ -882,13 +853,17 @@ app.get('/api/store/:viewUid/products', async (req, res) => {
                 origin_lat: detail.origin_lat,
                 origin_lng: detail.origin_lng
             },
-            products: formattedProducts,
-            total_products: formattedProducts.length
+            products: allProducts,
+            total_products: allProducts.length,
+            total_categories: categories.length
         });
     } catch (err) {
+        console.error('❌ [store products]', err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 });
+
+
 
 // ─────────────────────────────────────────────────────────────
 // START SERVER
