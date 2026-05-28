@@ -843,6 +843,53 @@ app.get('/api/store/:viewUid/menu-stream', async (req, res) => {
     }
 });
 
+// GET /api/store/:viewUid/products?lat=&lng=
+app.get('/api/store/:viewUid/products', async (req, res) => {
+    try {
+        const { viewUid } = req.params;
+        const userCoords = parseUserCoords(req.query);
+
+        const [detail, products] = await Promise.all([
+            fetchStoreDetail(viewUid),
+            fetchStoreProducts(viewUid)
+        ]);
+
+        // Hitung jarak
+        const distance = (detail.origin_lat && detail.origin_lng)
+            ? getDistance(userCoords.lat, userCoords.lng, detail.origin_lat, detail.origin_lng)
+            : null;
+
+        // Format produk dengan info toko
+        const formattedProducts = products.map(p => ({
+            view_uid: p.view_uid,
+            title: p.title,
+            image: p.image,
+            price: p.price,
+            content: p.content || '',
+            product_category: p.category_name || '',
+            store_view_uid: detail.view_uid,
+            store_title: detail.title,
+            store_distance: distance,
+            store_is_open: detail.is_open
+        }));
+
+        res.json({
+            success: true,
+            store: {
+                view_uid: detail.view_uid,
+                title: detail.title,
+                origin_address: detail.origin_address || '',
+                origin_lat: detail.origin_lat,
+                origin_lng: detail.origin_lng
+            },
+            products: formattedProducts,
+            total_products: formattedProducts.length
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // ─────────────────────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────────────────────
