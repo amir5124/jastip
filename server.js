@@ -743,6 +743,107 @@ app.get('/api/store/:viewUid/products', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
+// SSE: /api/store/:viewUid/menu-stream
+//
+// Streaming semua produk dari satu toko, dikelompokkan per kategori.
+// Event-event:
+//   meta      → info awal (total_categories, store_name)
+//   category  → satu kategori beserta produk-produknya
+//   progress  → progres loading
+//   done      → selesai
+//   error     → fatal error
+// ─────────────────────────────────────────────────────────────
+app.get('/api/store/:viewUid/menu-stream', async (req, res) => {
+    const send = setupSSE(res);
+    req.on('close', () => res.end());
+
+    try {
+        const viewUid = req.params.viewUid;
+        const userCoords = parseUserCoords(req.query);
+
+        console.log(`📡 [menu-stream] store=${viewUid}`);
+
+        // Ambil detail toko
+        const storeDetail = await fetchStoreDetail(viewUid);
+
+        // Ambil semua produk toko
+        const products = await fetchStoreProducts(viewUid);
+
+        // Kelompokkan produk berdasarkan kategori
+        const categoryMap = new Map();
+
+        products.forEach(product => {
+            const catName = product.category_name || 'Lainnya';
+            const catKey = product.category_uid || catName;
+
+            if (!categoryMap.has(catKey)) {
+                categoryMap.set(catKey, {
+                    view_uid: catKey,
+                    title: catName,
+                    products: []
+                });
+            }
+
+            // Tambahkan jarak ke produk (dari toko)
+            const distance = (storeDetail.origin_lat && storeDetail.origin_lng)
+                ? getDistance(userCoords.lat, userCoords.lng, storeDetail.origin_lat, storeDetail.origin_lng)
+                : null;
+
+            categoryMap.get(catKey).products.push({
+                view_uid: product.view_uid,
+                title: product.title,
+                image: product.image,
+                price: product.price,
+                content: product.content || '',
+                category_name: product.category_name || '',
+                store_distance: distance
+            });
+        });
+
+        // Konversi ke array dan urutkan
+        const categories = Array.from(categoryMap.values());
+
+        // Kirim meta info
+        send('meta', {
+            total_categories: categories.length,
+            store_name: storeDetail.title,
+            store_uid: viewUid
+        });
+
+        // Kirim setiap kategori satu per satu (sebagai SSE event)
+        for (let i = 0; i < categories.length; i++) {
+            const category = categories[i];
+
+            send('category', {
+                category_index: i + 1,
+                total_categories: categories.length,
+                category: category
+            });
+
+            send('progress', {
+                percent: Math.round(((i + 1) / categories.length) * 100),
+                current: i + 1,
+                total: categories.length
+            });
+
+            // Delay kecil agar tidak overload
+            await new Promise(resolve => setTimeout(resolve, 50));
+        }
+
+        send('done', {
+            total_categories: categories.length,
+            total_products: products.length
+        });
+        res.end();
+
+    } catch (err) {
+        console.error('❌ [menu-stream]', err.message);
+        send('error', { message: err.message });
+        res.end();
+    }
+});
+
+// ─────────────────────────────────────────────────────────────
 // START SERVER
 // ─────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
