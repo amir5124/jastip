@@ -718,6 +718,83 @@ app.get('/api/store/:viewUid', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
+// FUNGSI FETCH DATA DARI JAGEL (PERBAIKAN)
+// ─────────────────────────────────────────────────────────────
+
+/** Ambil semua kategori dari toko (children dengan type=4) */
+async function fetchStoreCategories(viewUid) {
+    try {
+        let all = [], page = 1, lastPage = 1;
+        do {
+            const url = `https://app.jagel.id/api/v2/customer/list/${viewUid}/children`
+                + `?codename=${CODENAME}&page=${page}&per_page=100`;
+            const { data } = await axios.get(url, { headers: jagelHeaders });
+            if (!data.success) throw new Error(`Children API error for ${viewUid}`);
+
+            // Filter hanya type = 4 (kategori menu)
+            const categories = (data.data.data || []).filter(item => item.type === 4);
+            all.push(...categories);
+            lastPage = data.data.last_page;
+            page++;
+        } while (page <= lastPage);
+        return all;
+    } catch (err) {
+        console.log(`⚠️  Categories ${viewUid}: ${err.message}`);
+        return [];
+    }
+}
+
+/** Ambil semua produk dari satu kategori (children dari kategori) */
+async function fetchCategoryProducts(categoryUid) {
+    try {
+        let all = [], page = 1, lastPage = 1;
+        do {
+            const url = `https://app.jagel.id/api/v2/customer/list/${categoryUid}/children`
+                + `?codename=${CODENAME}&page=${page}&per_page=100`;
+            const { data } = await axios.get(url, { headers: jagelHeaders });
+            if (!data.success) break;
+
+            // Filter produk (type bukan 4, atau semua children)
+            const products = (data.data.data || []).filter(item => item.type !== 4);
+            all.push(...products);
+            lastPage = data.data.last_page;
+            page++;
+        } while (page <= lastPage);
+        return all;
+    } catch (err) {
+        console.log(`⚠️  Category products: ${err.message}`);
+        return [];
+    }
+}
+
+/** Ambil semua produk dari satu toko (melalui kategori) */
+async function fetchStoreProducts(viewUid) {
+    try {
+        // 1. Ambil semua kategori dari toko
+        const categories = await fetchStoreCategories(viewUid);
+        console.log(`📦 Store ${viewUid}: ${categories.length} kategori ditemukan`);
+
+        // 2. Untuk setiap kategori, ambil produknya
+        const allProducts = [];
+        for (const category of categories) {
+            const products = await fetchCategoryProducts(category.view_uid);
+            // Tambahkan info kategori ke setiap produk
+            products.forEach(product => {
+                product.category_name = category.title;
+                product.category_uid = category.view_uid;
+            });
+            allProducts.push(...products);
+            console.log(`   - ${category.title}: ${products.length} produk`);
+        }
+
+        return allProducts;
+    } catch (err) {
+        console.log(`⚠️  Produk ${viewUid}: ${err.message}`);
+        return [];
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 // SSE: /api/store/:viewUid/menu-stream (PERBAIKAN)
 // ─────────────────────────────────────────────────────────────
 app.get('/api/store/:viewUid/menu-stream', async (req, res) => {
